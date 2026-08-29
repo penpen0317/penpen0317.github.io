@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -73,9 +76,8 @@ jobs:
           fi
 
       - name: notify
-        if: ${{ secrets.NTFY_TOPIC != '' }}
+        if: ${{ env.NTFY_TOPIC != '' }}
         env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           SUMMARY: ${{ steps.summary.outputs.line }}
         run: |
           curl -fsS -H "Title: USD/JPY signals" -H "Click: https://penpen0317.github.io/fx/" -d "$SUMMARY" "https://ntfy.sh/${NTFY_TOPIC}"
