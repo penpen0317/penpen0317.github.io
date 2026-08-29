@@ -1,0 +1,81 @@
+name: USD/JPY daily dashboard
+
+on:
+  schedule:
+    - cron: "35 22 * * 0-4"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-dashboard
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: penpen0317/penpen0317
+          ref: claude/minano-fx-auto-trading-h4rb6d
+          path: .fxbot-src
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install ./.fxbot-src
+
+      - name: fetch prices
+        working-directory: .fxbot-src
+        run: |
+          set +e
+          fxbot fetch --out data/usdjpy_daily.csv | tee fetch.out
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ "$code" -eq 3 ]; then
+            echo "::warning::fallback data source was used"
+          elif [ "$code" -ne 0 ]; then
+            echo "::error::price fetch failed"
+            exit 1
+          fi
+
+      - name: build dashboard
+        working-directory: .fxbot-src
+        run: |
+          fxbot dashboard --data data/usdjpy_daily.csv --out "$GITHUB_WORKSPACE/fx/index.html"
+
+      - name: summary
+        id: summary
+        working-directory: .fxbot-src
+        run: |
+          line="$(fxbot monitor --data data/usdjpy_daily.csv --oneline)"
+          echo "$line"
+          echo "line=$line" >> "$GITHUB_OUTPUT"
+          echo "### $line" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: publish
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add fx/index.html
+          if git diff --cached --quiet; then
+            echo "no change"
+          else
+            git commit -m "Update USD/JPY dashboard ($(date -u '+%Y-%m-%d'))"
+            git push
+          fi
+
+      - name: notify
+        if: ${{ secrets.NTFY_TOPIC != '' }}
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          SUMMARY: ${{ steps.summary.outputs.line }}
+        run: |
+          curl -fsS -H "Title: USD/JPY signals" -H "Click: https://penpen0317.github.io/fx/" -d "$SUMMARY" "https://ntfy.sh/${NTFY_TOPIC}"
