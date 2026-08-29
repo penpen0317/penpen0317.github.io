@@ -35,19 +35,60 @@ jobs:
 
       - run: pip install ./.fxbot-src
 
-      - name: fetch prices
+      - name: download stooq
+        id: stooq
+        continue-on-error: true
         working-directory: .fxbot-src
         run: |
-          set +e
-          fxbot fetch --out data/usdjpy_daily.csv | tee fetch.out
-          code=${PIPESTATUS[0]}
-          set -e
-          if [ "$code" -eq 3 ]; then
-            echo "::warning::fallback data source was used"
-          elif [ "$code" -ne 0 ]; then
-            echo "::error::price fetch failed"
-            exit 1
-          fi
+          mkdir -p data
+          curl -fsS --max-time 60 -A "Mozilla/5.0 (compatible; fxbot/1.0)" "https://stooq.com/q/d/l/?s=usdjpy&i=d" -o stooq.csv
+          head -2 stooq.csv
+
+      - name: validate and convert
+        id: convert
+        if: steps.stooq.outcome == 'success'
+        continue-on-error: true
+        working-directory: .fxbot-src
+        shell: python
+        run: |
+          import csv, sys
+
+          rows = []
+          with open("stooq.csv", newline="", encoding="utf-8") as fh:
+              for r in csv.DictReader(fh):
+                  low = {(k or "").strip().lower(): v for k, v in r.items()}
+                  try:
+                      d = low["date"].strip()
+                      c = float(low["close"])
+                      o = float(low.get("open") or c)
+                      h = float(low.get("high") or c)
+                      l = float(low.get("low") or c)
+                  except (KeyError, TypeError, ValueError, AttributeError):
+                      continue
+                  if not (20.0 <= c <= 1000.0):
+                      sys.exit(f"implausible USD/JPY value: {c}")
+                  if h < max(o, c) or l > min(o, c):
+                      sys.exit(f"inconsistent OHLC on {d}")
+                  rows.append((d, o, h, l, c))
+
+          if len(rows) < 220:
+              sys.exit(f"too few rows: {len(rows)}")
+          rows.sort()
+          if len({r[0] for r in rows}) != len(rows):
+              sys.exit("duplicate dates")
+
+          with open("data/usdjpy_daily.csv", "w", newline="", encoding="utf-8") as fh:
+              w = csv.writer(fh)
+              w.writerow(["date", "open", "high", "low", "close"])
+              w.writerows(rows)
+          print(f"stooq: {len(rows)} rows, latest {rows[-1][0]}, close {rows[-1][4]}")
+
+      - name: fallback source
+        if: steps.convert.outcome != 'success'
+        working-directory: .fxbot-src
+        run: |
+          echo "::warning::Stooq unavailable, using fallback"
+          fxbot fetch --out data/usdjpy_daily.csv
 
       - name: build dashboard
         working-directory: .fxbot-src
