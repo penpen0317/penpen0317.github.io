@@ -35,59 +35,103 @@ jobs:
 
       - run: pip install ./.fxbot-src
 
-      - name: download stooq
-        id: stooq
-        continue-on-error: true
-        working-directory: .fxbot-src
-        run: |
-          mkdir -p data
-          curl -fsS --max-time 60 -A "Mozilla/5.0 (compatible; fxbot/1.0)" "https://stooq.com/q/d/l/?s=usdjpy&i=d" -o stooq.csv
-          head -2 stooq.csv
-
-      - name: validate and convert
-        id: convert
-        if: steps.stooq.outcome == 'success'
+      - name: fetch prices
+        id: prices
         continue-on-error: true
         working-directory: .fxbot-src
         shell: python
         run: |
-          import csv, sys
+          import csv, json, os, sys, urllib.error, urllib.request
+          from datetime import datetime, timezone
 
-          rows = []
-          with open("stooq.csv", newline="", encoding="utf-8") as fh:
-              for r in csv.DictReader(fh):
+          MIN_ROWS, LO, HI = 220, 20.0, 1000.0
+          UA = {"User-Agent": "Mozilla/5.0 (compatible; fxbot/1.0)"}
+          YAHOO = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+                   "JPY=X?range=5y&interval=1d")
+          STOOQ = "https://stooq.com/q/d/l/?s=usdjpy&i=d"
+
+          def get(url):
+              req = urllib.request.Request(url, headers=UA)
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return r.read().decode("utf-8", "replace")
+
+          def parse_yahoo(payload):
+              node = ((json.loads(payload).get("chart") or {}).get("result") or [None])[0]
+              if not node:
+                  raise ValueError("no result node")
+              stamps = node.get("timestamp") or []
+              q = ((node.get("indicators") or {}).get("quote") or [{}])[0]
+              rows = []
+              for i, t in enumerate(stamps):
+                  vals = [(q.get(k) or [None] * len(stamps))[i]
+                          for k in ("open", "high", "low", "close")]
+                  if any(v is None for v in vals):
+                      continue
+                  o, h, l, c = (float(v) for v in vals)
+                  d = datetime.fromtimestamp(t, tz=timezone.utc).date().isoformat()
+                  rows.append((d, o, h, l, c))
+              return rows
+
+          def parse_stooq(payload):
+              rows = []
+              for r in csv.DictReader(payload.splitlines()):
                   low = {(k or "").strip().lower(): v for k, v in r.items()}
                   try:
-                      d = low["date"].strip()
                       c = float(low["close"])
-                      o = float(low.get("open") or c)
-                      h = float(low.get("high") or c)
-                      l = float(low.get("low") or c)
+                      rows.append((low["date"].strip(), float(low.get("open") or c),
+                                   float(low.get("high") or c),
+                                   float(low.get("low") or c), c))
                   except (KeyError, TypeError, ValueError, AttributeError):
                       continue
-                  if not (20.0 <= c <= 1000.0):
-                      sys.exit(f"implausible USD/JPY value: {c}")
-                  if h < max(o, c) or l > min(o, c):
-                      sys.exit(f"inconsistent OHLC on {d}")
-                  rows.append((d, o, h, l, c))
+              return rows
 
-          if len(rows) < 220:
-              sys.exit(f"too few rows: {len(rows)}")
-          rows.sort()
-          if len({r[0] for r in rows}) != len(rows):
-              sys.exit("duplicate dates")
+          def clean(rows):
+              kept, dropped = [], 0
+              for d, o, h, l, c in rows:
+                  if not (LO <= c <= HI) or h < max(o, c) or l > min(o, c):
+                      dropped += 1
+                      continue
+                  kept.append((d, o, h, l, c))
+              kept.sort()
+              kept = [r for i, r in enumerate(kept) if i == 0 or r[0] != kept[i - 1][0]]
+              if len(kept) < MIN_ROWS:
+                  raise ValueError(f"too few usable rows ({len(kept)}, dropped {dropped})")
+              if dropped > max(5, len(rows) * 0.05):
+                  raise ValueError(f"too many bad rows ({dropped}/{len(rows)})")
+              return kept, dropped
 
-          with open("data/usdjpy_daily.csv", "w", newline="", encoding="utf-8") as fh:
-              w = csv.writer(fh)
-              w.writerow(["date", "open", "high", "low", "close"])
-              w.writerows(rows)
-          print(f"stooq: {len(rows)} rows, latest {rows[-1][0]}, close {rows[-1][4]}")
+          problems = []
+          for label, url, parse in (("yahoo", YAHOO, parse_yahoo),
+                                    ("stooq", STOOQ, parse_stooq)):
+              try:
+                  payload = get(url)
+              except (urllib.error.URLError, OSError, TimeoutError) as exc:
+                  problems.append(f"{label}: fetch failed: {exc}")
+                  continue
+              try:
+                  rows, dropped = clean(parse(payload))
+              except Exception as exc:
+                  problems.append(f"{label}: {type(exc).__name__}: {exc} "
+                                  f"| body[:160]={payload[:160]!r}")
+                  continue
+              os.makedirs("data", exist_ok=True)
+              with open("data/usdjpy_daily.csv", "w", newline="", encoding="utf-8") as fh:
+                  w = csv.writer(fh)
+                  w.writerow(["date", "open", "high", "low", "close"])
+                  w.writerows(rows)
+              print(f"{label}: {len(rows)} rows (dropped {dropped}), "
+                    f"latest {rows[-1][0]}, close {rows[-1][4]:.3f}")
+              sys.exit(0)
+
+          for p in problems:
+              print(f"::warning::{p}")
+          sys.exit(1)
 
       - name: fallback source
-        if: steps.convert.outcome != 'success'
+        if: steps.prices.outcome != 'success'
         working-directory: .fxbot-src
         run: |
-          echo "::warning::Stooq unavailable, using fallback"
+          echo "::warning::fresh sources unavailable, using fallback"
           fxbot fetch --out data/usdjpy_daily.csv
 
       - name: build dashboard
